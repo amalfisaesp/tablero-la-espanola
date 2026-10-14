@@ -526,6 +526,420 @@
     }
   }
 
+  // ==========================================================================
+  // INDICADORES Y GRÁFICOS (todas las hojas). Se calcula en el navegador con las filas ya filtradas.
+  // Reglas: una celda vacía es "sin información" (nunca cero); cada variable se agrega según su
+  // naturaleza (suma, promedio, instantáneo, lectura acumulada) y se rotula así.
+  // ==========================================================================
+  var IND_CSS_OK = false;
+  var IND_PALETA = ['#4FB6B6', '#7FA843', '#E9B21E', '#2F8F8F', '#D64545', '#A9D06B', '#707070', '#F0E02A'];
+  var IND_ULTIMO = /^hora (inicio|final)$/i;
+  var IND_INST = /caudal|temperatura|humedad|\bph\b|presi[oó]n|ch4|\bco\b|h2s|lel|\bo2\b|pm10|pm2|ox[ií]geno|conductividad/i;
+  var IND_PROM = /porcentaje|%|altura|ancho|largo|dosis|desv|promedio|pendiente|duraci[oó]n|tiempo|eficiencia|densidad|area_|área|aforo/i;
+  var IND_SUMA = /\((kg|ton|t|m3|m³|l|litros|ml)\)|peso|tonelada|volumen|viajes|cantidad|cestas|horas trabajadas|[aá]rboles|lluvia|asistentes|visitantes|avistamientos|d[ií]as de paro|total/i;
+  // Hojas donde la medición es por muestra o por visita: nunca se suma.
+  var IND_SOLO_PROM = { COMPACTACION: 1, CAPTACION_AFOROS: 1, CAUDAL_LIXIVIADO: 1, COBERTURA: 1, ARD_CAUDAL: 1, TOPOGRAFIA: 1, MONITOREO_AIRE: 1, TEMPERATURA: 1 };
+  // Hojas de conteo de viajes: todas las columnas son conteos (se suman), salvo el promedio.
+  var IND_SOLO_SUMA = { VIAJES_DIA: 1, VIAJES_MES: 1, VIAJES_SEMANA: 1 };
+  var IND_OMITIR = /^(mes|año|ano|id|chimenea|total especies)$|^(foto|fotograf|registro_foto|registro foto|imagen|soporte|listado|acta|cajas)/i;
+  var indSel = { hoja: null, variable: null, agrupar: null, cat: null, acum: false, tipo: 'auto', forma: 'barras' };
+
+  function indCss() {
+    if (IND_CSS_OK) return; IND_CSS_OK = true;
+    var s = document.createElement('style');
+    s.textContent =
+      '.ind-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:16px}' +
+      '.ind-kpi{background:var(--surface-sunken);border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:12px 14px;cursor:pointer;text-align:left;font:inherit;color:inherit}' +
+      '.ind-kpi:hover,.ind-kpi.on{border-color:var(--amalfi-teal);box-shadow:var(--shadow-focus)}' +
+      '.ind-kpi .k-t{font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em}' +
+      '.ind-kpi .k-v{font-family:var(--font-display);font-size:22px;font-weight:600;color:var(--text-heading);margin:3px 0}' +
+      '.ind-kpi .k-s{font-size:11.5px;color:var(--text-muted)}' +
+      '.ind-kpi .k-v.nodato{font-size:15px;color:var(--text-subtle)}' +
+      '.ind-ctrl{display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin-bottom:10px}' +
+      '.ind-ctrl .field{min-width:170px}.ind-chk{font-size:13px;display:flex;gap:6px;align-items:center;padding-bottom:9px}' +
+      '.ind-charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}' +
+      '.ind-chart{border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:12px;background:var(--surface-card);min-width:0}' +
+      '.ind-chart h4{margin:0 0 6px;font-size:13px;color:var(--text-heading)}' +
+      '.ind-chart svg{width:100%;height:auto;display:block}' +
+      '.ind-nota{font-size:12px;color:var(--text-muted);margin-top:8px}' +
+      '.ind-lectura ul{margin:6px 0 0 18px;padding:0}.ind-lectura li{margin:5px 0;font-size:13px;line-height:1.45}';
+    document.head.appendChild(s);
+  }
+
+  function indNum(t) {
+    if (t == null) return null;
+    var s = String(t).replace(/[%\s]/g, '').replace(/[^\d,.\-]/g, '');
+    if (s === '' || s === '-') return null;
+    if (s.indexOf(',') > -1) s = s.replace(/\./g, '').replace(',', '.');
+    else if (/^-?\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g, '');
+    var n = parseFloat(s);
+    return isNaN(n) ? null : n;
+  }
+  function indDur(t) {
+    var m = String(t || '').match(/^(\d+):(\d{2})/);
+    if (m) return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+    return indNum(t);
+  }
+  function indFecha(t) {
+    var m = String(t || '').match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    return m ? new Date(parseInt(m[3], 10), parseInt(m[2], 10) - 1, parseInt(m[1], 10)) : null;
+  }
+  function indFmt(v) {
+    if (v == null || isNaN(v)) return 'sin dato';
+    var dec = Math.abs(v) < 1 && v !== 0 ? 4 : (Math.abs(v) >= 1000 ? 0 : 2);
+    var s = v.toFixed(dec).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
+    var p = s.split('.'); p[0] = p[0].replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+    return p.join(',');
+  }
+  function indCriterio(hoja, h) {
+    if (IND_ULTIMO.test(h)) return 'ultimo';
+    if (IND_INST.test(h)) return 'inst';
+    if (IND_SOLO_SUMA[hoja]) return /promedio/i.test(h) ? 'prom' : 'suma';
+    if (IND_SOLO_PROM[hoja]) return 'prom';
+    if (IND_PROM.test(h)) return 'prom';
+    if (IND_SUMA.test(h)) return 'suma';
+    return 'prom';
+  }
+  function indEtq(c) { return { suma: 'Suma', prom: 'Promedio', inst: 'Instantáneo · promedio', ultimo: 'Lectura acumulada · último valor' }[c]; }
+  function indAgg(vals, crit) {
+    if (!vals.length) return null;
+    if (crit === 'suma') return vals.reduce(function (a, b) { return a + b; }, 0);
+    if (crit === 'ultimo') return vals[vals.length - 1];
+    return vals.reduce(function (a, b) { return a + b; }, 0) / vals.length;
+  }
+
+  function indBucket(d, modo) {
+    var y = d.getFullYear(), m = ('0' + (d.getMonth() + 1)).slice(-2), dd = ('0' + d.getDate()).slice(-2);
+    return modo === 'mes' ? y + '-' + m : y + '-' + m + '-' + dd;
+  }
+  function indSiguiente(k, modo) {
+    var p = k.split('-'), d = new Date(+p[0], +p[1] - 1, modo === 'mes' ? 1 : +p[2]);
+    if (modo === 'mes') d.setMonth(d.getMonth() + 1); else d.setDate(d.getDate() + 1);
+    return indBucket(d, modo);
+  }
+  function indEtqBucket(k, modo) {
+    var p = k.split('-'), M = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
+    return modo === 'mes' ? M[+p[1] - 1] + ' ' + String(p[0]).slice(2) : p[2] + '/' + p[1];
+  }
+
+  function indSvgSerie(pts, tipo, color, unidad) {
+    var W = 640, H = 260, L = 58, R = 12, T = 12, B = 44, pw = W - L - R, ph = H - T - B;
+    var vs = pts.filter(function (p) { return p.v != null; }).map(function (p) { return p.v; });
+    if (!vs.length) return '<div class="empty-state">Sin información para graficar.</div>';
+    var mn = Math.min.apply(null, vs), mx = Math.max.apply(null, vs);
+    if (tipo === 'bar') mn = Math.min(0, mn);
+    if (mx === mn) mx = mn + 1;
+    var pad = (mx - mn) * 0.06; if (tipo !== 'bar') mn -= pad; mx += pad;
+    function y(v) { return T + ph - (v - mn) / (mx - mn) * ph; }
+    var n = pts.length, bw = pw / n, g = '';
+    for (var i = 0; i <= 4; i++) {
+      var val = mn + (mx - mn) * i / 4, yy = y(val);
+      g += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + yy + '" y2="' + yy + '" stroke="#ECECEC"/><text x="' + (L - 6) + '" y="' + (yy + 4) + '" text-anchor="end" font-size="10" fill="#707070">' + esc(indFmt(val)) + '</text>';
+    }
+    var paso = Math.ceil(n / 12), linea = [], marcas = '';
+    pts.forEach(function (p, k) {
+      var cx = L + bw * k + bw / 2;
+      if (k % paso === 0) g += '<text x="' + cx + '" y="' + (H - B + 16) + '" text-anchor="middle" font-size="10" fill="#707070">' + esc(p.etq) + '</text>';
+      if (p.v == null) return;
+      var tt = '<title>' + esc(p.etq + ': ' + indFmt(p.v) + (unidad ? ' ' + unidad : '') + (p.n ? ' · ' + p.n + ' registro(s)' : '')) + '</title>';
+      if (tipo === 'bar') {
+        var y0 = y(0), yy2 = y(p.v), top = Math.min(y0, yy2), h = Math.max(1, Math.abs(y0 - yy2));
+        g += '<rect x="' + (L + bw * k + bw * 0.15) + '" y="' + top + '" width="' + (bw * 0.7) + '" height="' + h + '" rx="2" fill="' + color + '">' + tt + '</rect>';
+      } else {
+        linea.push(cx + ',' + y(p.v));
+        marcas += '<circle cx="' + cx + '" cy="' + y(p.v) + '" r="3.2" fill="' + color + '">' + tt + '</circle>';
+      }
+    });
+    if (tipo === 'area' && linea.length > 1) { var p0 = linea[0].split(','), p1 = linea[linea.length - 1].split(','); g += '<polygon fill="' + color + '" fill-opacity="0.18" points="' + p0[0] + ',' + y(mn) + ' ' + linea.join(' ') + ' ' + p1[0] + ',' + y(mn) + '"/>'; }
+    if (tipo !== 'bar' && linea.length > 1) g += '<polyline fill="none" stroke="' + color + '" stroke-width="2" points="' + linea.join(' ') + '"/>';
+    g += marcas;
+    return '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img">' + g + '</svg>';
+  }
+
+  function indSvgBarrasH(items, color, unidad) {
+    if (!items.length) return '<div class="empty-state">Sin información para graficar.</div>';
+    var W = 640, rowH = 26, L = 170, R = 70, H = items.length * rowH + 10;
+    var mx = Math.max.apply(null, items.map(function (i) { return Math.max(i.v, 0); })) || 1, g = '';
+    items.forEach(function (it, k) {
+      var yy = 6 + k * rowH, w = Math.max(1, (W - L - R) * Math.max(it.v, 0) / mx);
+      var et = String(it.etq).length > 26 ? String(it.etq).slice(0, 25) + '…' : it.etq;
+      g += '<text x="' + (L - 6) + '" y="' + (yy + 15) + '" text-anchor="end" font-size="11" fill="#404040">' + esc(et) + '</text>' +
+        '<rect x="' + L + '" y="' + (yy + 3) + '" width="' + w + '" height="16" rx="3" fill="' + IND_PALETA[k % IND_PALETA.length] + '"><title>' + esc(it.etq + ': ' + indFmt(it.v) + (unidad ? ' ' + unidad : '') + ' · ' + it.n + ' registro(s)') + '</title></rect>' +
+        '<text x="' + (L + w + 5) + '" y="' + (yy + 15) + '" font-size="11" fill="#707070">' + esc(indFmt(it.v)) + '</text>';
+    });
+    return '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img">' + g + '</svg>';
+  }
+
+  // Comparación de captación contra el caudal concesionado. El valor lo escribe el usuario (acto de concesión);
+  // no se supone ninguno. Se compara caudal medido (L/s) contra caudal autorizado (L/s): no es un volumen captado.
+  function indConcesion(card, vars) {
+    var v = vars.filter(function (x) { return /^caudal_prom/i.test(x.h); })[0];
+    var box = el('div', { class: 'ind-chart', style: 'margin-bottom:16px' });
+    var guardado = '0,007'; try { var gs = localStorage.getItem('conc_ls'); if (gs !== null) guardado = gs; } catch (e) {}
+    box.innerHTML = '<h4>Captación frente al caudal concesionado</h4>' +
+      '<div class="ind-ctrl"><div class="field"><label>Caudal concesionado (L/s)</label><input type="text" id="indConc" inputmode="decimal" placeholder="según el acto de concesión" value="' + esc(guardado) + '"></div></div>' +
+      '<div class="ind-nota">Valor inicial: 0,007 L/s, Res. 130ZF-2896 de 2007 (uso doméstico de la caseta de control; vigencia = vida útil por Res. 160ZF-1608-8159 de 2016). Se asume que el aforo mide el caudal derivado; modifique el valor si aplica otra concesión.</div>' +
+      '<div id="indConcRes" class="ind-nota"></div>';
+    card.appendChild(box);
+    var pinta = function () {
+      var c = indNum(box.querySelector('#indConc').value), res = box.querySelector('#indConcRes');
+      try { localStorage.setItem('conc_ls', box.querySelector('#indConc').value); } catch (e) {}
+      if (!v) { res.textContent = 'No hay mediciones de caudal promedio en el período.'; return; }
+      if (!c || c <= 0) { res.textContent = 'Sin comparación: falta registrar el caudal concesionado (se toma del acto administrativo de la concesión). No se asume ningún valor.'; return; }
+      var prom = indAgg(v.vals, 'prom'), mx = Math.max.apply(null, v.vals), sobre = v.vals.filter(function (x) { return x > c; }).length;
+      res.innerHTML = 'Promedio de las mediciones: <b>' + esc(indFmt(prom)) + ' L/s</b> = <b>' + esc(indFmt(prom / c * 100)) + ' %</b> del caudal concesionado (' + esc(indFmt(c)) + ' L/s). Máximo medido: ' + esc(indFmt(mx)) + ' L/s (' + esc(indFmt(mx / c * 100)) + ' %). Mediciones por encima de lo concesionado: <b>' + sobre + '</b> de ' + v.n + '. ' + (v.sin ? v.sin + ' registro(s) sin caudal no se incluyen. ' : '') + 'Se compara caudal medido contra caudal autorizado; no equivale a volumen captado ni a cumplimiento de la concesión.';
+    };
+    box.querySelector('#indConc').oninput = pinta; pinta();
+  }
+
+  function renderIndicadores(r, root, hoja) {
+    indCss();
+    if (indSel.hoja !== hoja) indSel = { hoja: hoja, variable: null, agrupar: null, cat: null, acum: false, tipo: 'auto', forma: 'barras' };
+    var enc = r.encabezados, tipos = r.tipos, filas = r.filas;
+    var card = el('div', { class: 'card' });
+    card.appendChild(el('p', { class: 'card-title' }, '<i data-lucide="bar-chart-3"></i>Indicadores y gráficos'));
+    if (!filas.length) {
+      card.appendChild(el('div', { class: 'empty-state' }, 'Sin registros para los filtros aplicados: no hay indicadores que calcular.'));
+      root.appendChild(card); return;
+    }
+    var cf = -1; enc.forEach(function (h, i) { if (cf < 0 && tipos[i] === 'fecha') cf = i; });
+    // variables numéricas
+    var vars = [];
+    enc.forEach(function (h, i) {
+      var t = tipos[i];
+      if (IND_OMITIR.test(h) || !(t === 'numero' || t === 'porcentaje' || t === 'moneda' || t === 'duracion')) return;
+      var vals = [], sin = 0;
+      filas.forEach(function (f) {
+        var c = f[i], v = (c && c.t !== '') ? (t === 'duracion' ? indDur(c.t) : indNum(c.t)) : null;
+        if (v == null) sin++; else vals.push(v);
+      });
+      if (!vals.length) return;
+      vars.push({ i: i, h: h, crit: indCriterio(hoja, h), n: vals.length, sin: sin, vals: vals });
+    });
+    var IND_PRI = [/caudal_prom/i, /caudal \(m³\/día\)/i, /^peso \(kg\)/i, /^ingreso de residuos/i, /porcentaje/i, /lluvia/i, /asistentes|visitantes|avistamientos/i, /^volumen/i, /horas trabajadas/i, /^total/i];
+    var prio = function (h) { for (var p = 0; p < IND_PRI.length; p++) if (IND_PRI[p].test(h)) return p; return 99; };
+    vars.sort(function (a, b) { return prio(a.h) - prio(b.h) || a.i - b.i; });
+    // fechas
+    var fechas = [], dset = {};
+    if (cf >= 0) filas.forEach(function (f) { var d = indFecha(f[cf] && f[cf].t); if (d) { fechas.push(d); dset[indBucket(d, 'dia')] = 1; } });
+    var dmin = null, dmax = null;
+    fechas.forEach(function (d) { if (!dmin || d < dmin) dmin = d; if (!dmax || d > dmax) dmax = d; });
+    var fmtD = function (d) { return ('0' + d.getDate()).slice(-2) + '/' + ('0' + (d.getMonth() + 1)).slice(-2) + '/' + d.getFullYear(); };
+
+    // KPIs
+    var kp = el('div', { class: 'ind-kpis' });
+    var k = function (id, t, v, s, nodato) {
+      return '<button type="button" class="ind-kpi' + (indSel.variable === id ? ' on' : '') + '" data-v="' + esc(id) + '"><div class="k-t">' + esc(t) + '</div><div class="k-v' + (nodato ? ' nodato' : '') + '">' + esc(v) + '</div><div class="k-s">' + esc(s) + '</div></button>';
+    };
+    var html = k('__n', 'Registros', String(filas.length), dmin ? fmtD(dmin) + ' – ' + fmtD(dmax) : 'sin columna de fecha');
+    if (dmin) html += k('__dias', 'Días con registro', String(Object.keys(dset).length), 'de ' + (Math.round((dmax - dmin) / 86400000) + 1) + ' días del rango');
+    vars.slice(0, 10).forEach(function (v) {
+      html += k(String(v.i), indEtq(v.crit) + ' · ' + v.h, indFmt(indAgg(v.vals, v.crit)), v.n + ' con dato' + (v.sin ? ' · ' + v.sin + ' sin información' : ''));
+    });
+    kp.innerHTML = html; card.appendChild(kp);
+    if (hoja === 'CAPTACION_AFOROS') indConcesion(card, vars);
+
+    // controles
+    if (!indSel.variable || (indSel.variable !== '__n' && indSel.variable !== '__dias' && !vars.some(function (v) { return String(v.i) === indSel.variable; }))) {
+      indSel.variable = vars.length ? String(vars[0].i) : '__n';
+    }
+    var cats = [];
+    enc.forEach(function (h, i) {
+      if (tipos[i] !== 'texto' || IND_OMITIR.test(h) || /observ|conductor|operario|responsable|registrado|fotograf|descripci|tema|listado|actividad/i.test(h)) return;
+      var cnt = {}, nd = 0; filas.forEach(function (f) { var t = f[i] && f[i].t; if (t) { if (!cnt[t]) nd++; cnt[t] = 1; } });
+      if (nd >= 2 && nd <= 15) cats.push({ i: i, h: h });
+    });
+    var span = dmin ? Math.round((dmax - dmin) / 86400000) : 0;
+    if (!indSel.agrupar) indSel.agrupar = span > 62 ? 'mes' : 'dia';
+    var opts = '<option value="__n">Número de registros</option>' + vars.map(function (v) { return '<option value="' + v.i + '"' + (indSel.variable === String(v.i) ? ' selected' : '') + '>' + esc(v.h) + ' (' + indEtq(v.crit).split(' · ')[0].toLowerCase() + ')</option>'; }).join('');
+    var ctrl = el('div', { class: 'ind-ctrl' });
+    ctrl.innerHTML =
+      '<div class="field"><label>Variable</label><select id="indVar">' + opts + '</select></div>' +
+      (dmin ? '<div class="field"><label>Agrupar por</label><select id="indAgr"><option value="dia"' + (indSel.agrupar === 'dia' ? ' selected' : '') + '>Día</option><option value="mes"' + (indSel.agrupar === 'mes' ? ' selected' : '') + '>Mes</option></select></div>' : '') +
+      '<div class="field"><label>Tipo de gráfico</label><select id="indTipo">' + [['auto', 'Automático'], ['bar', 'Barras'], ['line', 'Líneas'], ['area', 'Área']].map(function (o) { return '<option value="' + o[0] + '"' + (indSel.tipo === o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; }).join('') + '</select></div>' +
+      (cats.length ? '<div class="field"><label>Comparar por</label><select id="indCat">' + cats.map(function (c) { return '<option value="' + c.i + '"' + (indSel.cat === String(c.i) ? ' selected' : '') + '>' + esc(c.h) + '</option>'; }).join('') + '</select></div>' : '') +
+      (cats.length ? '<div class="field"><label>Forma de la comparación</label><select id="indForma"><option value="barras"' + (indSel.forma === 'barras' ? ' selected' : '') + '>Barras</option><option value="dona"' + (indSel.forma === 'dona' ? ' selected' : '') + '>Dona</option></select></div>' : '') +
+      '<label class="ind-chk"><input type="checkbox" id="indAcum"' + (indSel.acum ? ' checked' : '') + '> Ver acumulado (solo sumas)</label>';
+    card.appendChild(ctrl);
+
+    var cur = indSel.variable === '__n' ? { i: -1, h: 'Registros', crit: 'suma' } : (vars.filter(function (v) { return String(v.i) === indSel.variable; })[0] || { i: -1, h: 'Registros', crit: 'suma' });
+    var esN = cur.i < 0;
+    var charts = el('div', { class: 'ind-charts' });
+
+    // serie temporal
+    if (dmin) {
+      var modo = indSel.agrupar === 'mes' || span > 150 ? 'mes' : 'dia';
+      var buckets = {}, ini = indBucket(dmin, modo), fin = indBucket(dmax, modo);
+      filas.forEach(function (f) {
+        var d = indFecha(f[cf] && f[cf].t); if (!d) return;
+        var b = indBucket(d, modo); buckets[b] = buckets[b] || { vals: [], n: 0 }; buckets[b].n++;
+        if (!esN) { var c = f[cur.i], v = (c && c.t !== '') ? (tipos[cur.i] === 'duracion' ? indDur(c.t) : indNum(c.t)) : null; if (v != null) buckets[b].vals.push(v); }
+      });
+      var pts = [], kx = ini, guard = 0, acc = 0, usaAcum = indSel.acum && cur.crit === 'suma';
+      while (guard++ < 400) {
+        var bk = buckets[kx], v = null;
+        if (bk) { v = esN ? bk.n : indAgg(bk.vals, cur.crit); }
+        if (usaAcum && v != null) { acc += v; v = acc; }
+        pts.push({ etq: indEtqBucket(kx, modo), v: usaAcum ? (v == null && pts.length ? acc : v) : v, n: bk ? bk.n : 0 });
+        if (kx === fin) break; kx = indSiguiente(kx, modo);
+      }
+      var tipoG = (indSel.tipo && indSel.tipo !== 'auto') ? indSel.tipo : ((cur.crit === 'suma' && !usaAcum) ? 'bar' : 'line');
+      var tit = (esN ? 'Registros' : indEtq(cur.crit).split(' · ')[0] + ' de ' + cur.h) + (usaAcum ? ' (acumulado)' : '') + ' por ' + (modo === 'mes' ? 'mes' : 'día');
+      var c1 = el('div', { class: 'ind-chart' }, '<h4>' + esc(tit) + '</h4>' + indSvgSerie(pts, tipoG, IND_PALETA[0], '') +
+        '<div class="ind-nota">Los períodos sin registro quedan en blanco: no se toman como cero. ' + (cur.crit === 'inst' ? 'Es una medición instantánea: se promedia, no se suma.' : (cur.crit === 'ultimo' ? 'Es una lectura acumulada del equipo: se muestra el último valor del período.' : '')) + '</div>');
+      charts.appendChild(c1);
+    }
+
+    // comparación por categoría
+    if (cats.length) {
+      var cc = cats.filter(function (c) { return indSel.cat === String(c.i); })[0] || cats[0];
+      indSel.cat = String(cc.i);
+      var grp = {};
+      filas.forEach(function (f) {
+        var t = f[cc.i] && f[cc.i].t; if (!t) return;
+        grp[t] = grp[t] || { vals: [], n: 0 }; grp[t].n++;
+        if (!esN) { var c = f[cur.i], v = (c && c.t !== '') ? (tipos[cur.i] === 'duracion' ? indDur(c.t) : indNum(c.t)) : null; if (v != null) grp[t].vals.push(v); }
+      });
+      var items = Object.keys(grp).map(function (t) { return { etq: t, n: grp[t].n, v: esN ? grp[t].n : indAgg(grp[t].vals, cur.crit) }; })
+        .filter(function (x) { return x.v != null; }).sort(function (a, b) { return b.v - a.v; }).slice(0, 12);
+      var sinCat = filas.filter(function (f) { return !(f[cc.i] && f[cc.i].t); }).length;
+      charts.appendChild(el('div', { class: 'ind-chart' }, '<h4>' + esc((esN ? 'Registros' : indEtq(cur.crit).split(' · ')[0] + ' de ' + cur.h) + ' por ' + cc.h) + '</h4>' + (indSel.forma === 'dona' ? indSvgDona(items) : indSvgBarrasH(items, IND_PALETA[1], '')) +
+        '<div class="ind-nota">' + (sinCat ? sinCat + ' registro(s) sin ' + esc(cc.h) + ' no se incluyen. ' : '') + 'Se muestran hasta 12 categorías.</div>'));
+    }
+    card.appendChild(charts);
+    try { indExtras(card, { filas: filas, tipos: tipos, enc: enc, cf: cf, cur: cur, esN: esN, vars: vars, cats: cats, cc: cc || null, dmin: dmin, dmax: dmax, span: span, hoja: hoja }); } catch (e) { /* la lectura extra nunca debe impedir ver los gráficos */ }
+    root.appendChild(card);
+
+    var redo = function () { var viejo = card; var tmp = document.createElement('div'); renderIndicadores(r, tmp, hoja); viejo.parentNode.replaceChild(tmp.firstChild, viejo); iconos(); };
+    var q = function (s) { return card.querySelector(s); };
+    q('#indVar').onchange = function () { indSel.variable = this.value; redo(); };
+    if (q('#indAgr')) q('#indAgr').onchange = function () { indSel.agrupar = this.value; redo(); };
+    if (q('#indCat')) q('#indCat').onchange = function () { indSel.cat = this.value; redo(); };
+    q('#indAcum').onchange = function () { indSel.acum = this.checked; redo(); };
+    if (q('#indTipo')) q('#indTipo').onchange = function () { indSel.tipo = this.value; redo(); };
+    if (q('#indForma')) q('#indForma').onchange = function () { indSel.forma = this.value; redo(); };
+    Array.prototype.forEach.call(card.querySelectorAll('.ind-kpi'), function (b) {
+      b.onclick = function () { var v = b.getAttribute('data-v'); if (v === '__dias') return; indSel.variable = v; redo(); };
+    });
+  }
+
+  // ==========================================================================
+  // TABLERO DE INTERPRETACIÓN (complemento): más indicadores, histograma, día de la semana,
+  // dona y una lectura automática y DESCRIPTIVA de los datos (no evalúa cumplimiento).
+  // ==========================================================================
+  function indMediana(a) { var s = a.slice().sort(function (x, y) { return x - y; }), n = s.length; return n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2; }
+  function indDesv(a, m) { if (a.length < 2) return 0; var s = 0; a.forEach(function (x) { s += (x - m) * (x - m); }); return Math.sqrt(s / (a.length - 1)); }
+  function indFd(d) { return d ? ('0' + d.getDate()).slice(-2) + '/' + ('0' + (d.getMonth() + 1)).slice(-2) + '/' + d.getFullYear() : 'sin fecha'; }
+
+  function indSvgDona(items) {
+    var tot = items.reduce(function (s, i) { return s + Math.max(i.v, 0); }, 0);
+    if (!items.length || tot <= 0) return '<div class="empty-state">Sin información para graficar.</div>';
+    var cx = 150, cy = 125, R = 105, r = 58, ang = -Math.PI / 2, g = '', leyenda = '';
+    items.forEach(function (it, k) {
+      var frac = Math.max(it.v, 0) / tot, a2 = ang + frac * 2 * Math.PI, col = IND_PALETA[k % IND_PALETA.length];
+      if (frac > 0.9999) {
+        g += '<circle cx="' + cx + '" cy="' + cy + '" r="' + ((R + r) / 2) + '" fill="none" stroke="' + col + '" stroke-width="' + (R - r) + '"><title>' + esc(it.etq + ': ' + indFmt(it.v)) + '</title></circle>';
+      } else if (frac > 0) {
+        var x1 = cx + R * Math.cos(ang), y1 = cy + R * Math.sin(ang), x2 = cx + R * Math.cos(a2), y2 = cy + R * Math.sin(a2);
+        var x3 = cx + r * Math.cos(a2), y3 = cy + r * Math.sin(a2), x4 = cx + r * Math.cos(ang), y4 = cy + r * Math.sin(ang), big = frac > 0.5 ? 1 : 0;
+        g += '<path d="M' + x1 + ',' + y1 + ' A' + R + ',' + R + ' 0 ' + big + ' 1 ' + x2 + ',' + y2 + ' L' + x3 + ',' + y3 + ' A' + r + ',' + r + ' 0 ' + big + ' 0 ' + x4 + ',' + y4 + ' Z" fill="' + col + '"><title>' + esc(it.etq + ': ' + indFmt(it.v) + ' (' + indFmt(frac * 100) + ' %)') + '</title></path>';
+      }
+      ang = a2;
+      var et = String(it.etq).length > 24 ? String(it.etq).slice(0, 23) + '…' : it.etq;
+      leyenda += '<rect x="330" y="' + (18 + k * 20) + '" width="11" height="11" rx="2" fill="' + col + '"/><text x="347" y="' + (28 + k * 20) + '" font-size="11" fill="#404040">' + esc(et) + ' · ' + esc(indFmt(frac * 100)) + ' %</text>';
+    });
+    g += '<text x="' + cx + '" y="' + (cy - 2) + '" text-anchor="middle" font-size="16" font-weight="700" fill="#404040">' + esc(indFmt(tot)) + '</text><text x="' + cx + '" y="' + (cy + 15) + '" text-anchor="middle" font-size="10" fill="#707070">total</text>';
+    return '<svg viewBox="0 0 640 ' + Math.max(250, 30 + items.length * 20) + '" role="img">' + g + leyenda + '</svg>';
+  }
+
+  function indExtras(card, c) {
+    var cur = c.cur, filas = c.filas, tipos = c.tipos, esN = c.esN, n0 = filas.length;
+    var pts = [];
+    filas.forEach(function (f) {
+      var d = c.cf >= 0 ? indFecha(f[c.cf] && f[c.cf].t) : null, v = 1;
+      if (!esN) { var cel = f[cur.i]; v = (cel && cel.t !== '') ? (tipos[cur.i] === 'duracion' ? indDur(cel.t) : indNum(cel.t)) : null; }
+      if (v !== null) pts.push({ d: d, v: v, f: f });
+    });
+    var wrap = el('div', { class: 'ind-extra' });
+    if (!pts.length) { return; }
+    var vals = pts.map(function (p) { return p.v; }), n = vals.length;
+    var porFecha = pts.filter(function (p) { return p.d; }).sort(function (a, b) { return a.d - b.d; });
+    var mx = pts[0], mn = pts[0];
+    pts.forEach(function (p) { if (p.v > mx.v) mx = p; if (p.v < mn.v) mn = p; });
+    var media = vals.reduce(function (a, b) { return a + b; }, 0) / n, desv = indDesv(vals, media), med = indMediana(vals);
+    var sinDato = esN ? 0 : (n0 - n);
+
+    // ---- Indicadores de la variable elegida
+    var kp = el('div', { class: 'ind-kpis' }), k = function (t, v, s) { return '<div class="ind-kpi" style="cursor:default"><div class="k-t">' + esc(t) + '</div><div class="k-v">' + esc(v) + '</div><div class="k-s">' + esc(s) + '</div></div>'; };
+    var h = '';
+    if (porFecha.length) { var ult = porFecha[porFecha.length - 1]; h += k('Último registro', indFmt(ult.v), indFd(ult.d)); }
+    h += k('Máximo', indFmt(mx.v), indFd(mx.d));
+    h += k('Mínimo', indFmt(mn.v), indFd(mn.d));
+    h += k('Mediana', indFmt(med), 'promedio ' + indFmt(media));
+    h += k('Variabilidad (desv. estándar)', indFmt(desv), media ? 'coef. de variación ' + indFmt(Math.abs(desv / media) * 100) + ' %' : '');
+    h += k('Sin información', n0 ? indFmt(sinDato / n0 * 100) + ' %' : '0 %', sinDato + ' de ' + n0 + ' registro(s)');
+    kp.innerHTML = h;
+    wrap.appendChild(el('p', { class: 'card-title', style: 'margin:14px 0 8px;font-size:15px' }, 'Detalle de «' + esc(cur.h) + '»'));
+    wrap.appendChild(kp);
+
+    // ---- Gráficos adicionales
+    var grid = el('div', { class: 'ind-charts' });
+    if (!esN && n >= 5) {
+      var nb = Math.min(10, Math.max(4, Math.ceil(Math.sqrt(n)))), lo = mn.v, hi = mx.v, ancho = (hi - lo) / nb || 1, cuentas = [];
+      for (var b = 0; b < nb; b++) cuentas.push(0);
+      vals.forEach(function (v) { var ix = Math.min(nb - 1, Math.floor((v - lo) / ancho)); cuentas[ix]++; });
+      var hp = cuentas.map(function (cn, ix) { return { etq: indFmt(lo + ix * ancho), v: cn, n: cn }; });
+      grid.appendChild(el('div', { class: 'ind-chart' }, '<h4>Distribución de ' + esc(cur.h) + ' (cuántos registros caen en cada rango)</h4>' + indSvgSerie(hp, 'bar', IND_PALETA[2], '') + '<div class="ind-nota">Cada barra cuenta registros cuyo valor empieza en el número indicado.</div>'));
+    }
+    if (porFecha.length >= 3) {
+      var dias = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom'], grp = [[], [], [], [], [], [], []];
+      porFecha.forEach(function (p) { grp[(p.d.getDay() + 6) % 7].push(p.v); });
+      var crit = esN ? 'suma' : cur.crit, sp = grp.map(function (a, ix) { return { etq: dias[ix], v: a.length ? indAgg(a, crit) : null, n: a.length }; });
+      grid.appendChild(el('div', { class: 'ind-chart' }, '<h4>' + esc((esN ? 'Registros' : indEtq(cur.crit).split(' · ')[0] + ' de ' + cur.h)) + ' por día de la semana</h4>' + indSvgSerie(sp, crit === 'suma' ? 'bar' : 'line', IND_PALETA[3], '') + '<div class="ind-nota">Los días sin registros quedan en blanco.</div>'));
+    }
+    if (grid.children.length) wrap.appendChild(grid);
+
+    // ---- Lectura automática (descriptiva)
+    var L = [];
+    if (c.dmin) {
+      var ndias = Math.round((c.dmax - c.dmin) / 86400000) + 1, dset = {};
+      porFecha.forEach(function (p) { dset[indBucket(p.d, 'dia')] = 1; });
+      var dc = Object.keys(dset).length;
+      L.push(n0 + ' registro(s) entre ' + indFd(c.dmin) + ' y ' + indFd(c.dmax) + '; hay registro en ' + dc + ' de ' + ndias + ' días del rango (' + indFmt(dc / ndias * 100) + ' %).');
+    } else L.push(n0 + ' registro(s); la tabla no tiene columna de fecha.');
+    if (!esN) {
+      var tot = vals.reduce(function (a, b) { return a + b; }, 0);
+      L.push(indEtq(cur.crit).split(' · ')[0] + ' de «' + cur.h + '»: ' + indFmt(cur.crit === 'suma' ? tot : media) + (cur.crit === 'suma' ? ' en total' : ' (promedio de ' + n + ' registros con dato)') + '. Máximo ' + indFmt(mx.v) + ' el ' + indFd(mx.d) + '; mínimo ' + indFmt(mn.v) + ' el ' + indFd(mn.d) + '.');
+      if (cur.crit === 'inst') L.push('Es una medición instantánea: el promedio describe el caudal o valor medido, no un volumen acumulado.');
+      if (cur.crit === 'ultimo') L.push('Es una lectura acumulada del equipo: lo relevante es el último valor y la diferencia entre lecturas.');
+      if (porFecha.length >= 8) {
+        var mitad = Math.floor(porFecha.length / 2), a1 = porFecha.slice(0, mitad).map(function (p) { return p.v; }), a2 = porFecha.slice(mitad).map(function (p) { return p.v; });
+        var m1 = a1.reduce(function (a, b) { return a + b; }, 0) / a1.length, m2 = a2.reduce(function (a, b) { return a + b; }, 0) / a2.length;
+        if (m1) L.push('Comparando mitades del período, la media pasa de ' + indFmt(m1) + ' a ' + indFmt(m2) + ' (' + (m2 >= m1 ? '+' : '') + indFmt((m2 - m1) / Math.abs(m1) * 100) + ' %).');
+      }
+      if (n >= 8 && desv > 0) {
+        var atip = pts.filter(function (p) { return p.v > media + 2 * desv; });
+        if (atip.length) L.push(atip.length + ' valor(es) superan el promedio más 2 desviaciones estándar (' + atip.slice(0, 4).map(function (p) { return indFd(p.d) + ': ' + indFmt(p.v); }).join('; ') + (atip.length > 4 ? '; …' : '') + '). Conviene revisar si son reales.');
+      }
+      if (cur.crit === 'suma' && porFecha.length) {
+        var pm = {}; porFecha.forEach(function (p) { var kk = indBucket(p.d, 'mes'); pm[kk] = (pm[kk] || 0) + p.v; });
+        var kmx = Object.keys(pm).sort(function (a, b) { return pm[b] - pm[a]; })[0];
+        if (Object.keys(pm).length > 1) L.push('El mes con mayor total fue ' + indEtqBucket(kmx, 'mes') + ' (' + indFmt(pm[kmx]) + ').');
+      }
+    }
+    if (c.cc) {
+      var gp = {}, tt = 0;
+      pts.forEach(function (p) { var t = p.f[c.cc.i] && p.f[c.cc.i].t; if (!t) return; gp[t] = (gp[t] || 0) + (esN || cur.crit === 'suma' ? p.v : 1); tt += (esN || cur.crit === 'suma' ? p.v : 1); });
+      var ks = Object.keys(gp).sort(function (a, b) { return gp[b] - gp[a]; });
+      if (ks.length > 1 && tt > 0) L.push('Por «' + c.cc.h + '», «' + ks[0] + '» concentra el ' + indFmt(gp[ks[0]] / tt * 100) + ' % (' + ks.length + ' categorías).');
+    }
+    var pobres = c.vars.filter(function (v) { return v.sin / (v.n + v.sin) > 0.2; }).slice(0, 5).map(function (v) { return v.h + ' (' + indFmt(v.sin / (v.n + v.sin) * 100) + ' %)'; });
+    if (pobres.length) L.push('Columnas con más de 20 % sin información: ' + pobres.join('; ') + '. Una celda vacía se interpreta como "sin información", no como cero.');
+    var lect = el('div', { class: 'ind-chart ind-lectura', style: 'margin-top:16px' }, '<h4>Lectura de los datos (automática)</h4><ul>' + L.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul><div class="ind-nota">Descripción de los registros filtrados; no evalúa cumplimiento normativo.</div>');
+    wrap.appendChild(lect);
+    card.appendChild(wrap);
+  }
+
   function renderTabla(r) {
     estado.encabezados = r.encabezados; estado.tipos = r.tipos;
     var root = $('#viewRoot'); root.innerHTML = '';
@@ -547,6 +961,7 @@
       (PUEDE_DESCARGAR ? '<button class="btn btn-secondary" id="bExport"><i data-lucide="download"></i>Exportar Excel</button>' : '');
     cardF.appendChild(row);
     root.appendChild(cardF);
+    try { renderIndicadores(r, root, estado.hoja); } catch (e) { /* los indicadores nunca deben impedir ver la tabla */ }
 
     var cardT = el('div', { class: 'card' });
     cardT.appendChild(el('p', { class: 'card-title' }, '<i data-lucide="table"></i>' + esc(r.titulo || estado.titulo)));
