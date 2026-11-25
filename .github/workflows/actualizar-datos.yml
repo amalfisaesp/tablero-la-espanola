@@ -1,0 +1,33 @@
+name: Actualizar datos del tablero
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+
+concurrency:
+  group: actualizar-datos
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 actualizar_datos.py
+      - name: Guardar y publicar si hubo cambios
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$(git status --porcelain datos.json)" ]; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add datos.json
+          git commit -m "Actualizar copia de datos"
+          git pull --rebase
+          git push
+          gh api -X POST "repos/$GITHUB_REPOSITORY/pages/builds"
